@@ -1,0 +1,20 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Environments
+venv/
+.venv/
+env/
+.env
+
+# SQLite databases & temp data
+*.db
+*.sqlite3
+
+# Distribution / builds
+dist/
+build/
+*.egg-info/
