@@ -4,6 +4,8 @@ A production-grade Python framework and interactive Streamlit application design
 Integrates SHA-256 deterministic variant assignment, robust SQLite event tracking, and two-proportion z-tests validated against Statsmodels.
 Features Monte Carlo simulation engines demonstrating A/A uniform p-value calibration, optional stopping alpha inflation, and empirical power curves.
 
+See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for a detailed module-by-module guide, database schema, data flows, and glossary.
+
 ---
 
 ## 1. Problem Statement
@@ -36,7 +38,7 @@ maths/
 │   └── app.py                      # Multi-tab interactive Streamlit web dashboard
 │
 ├── data/
-│   └── marketing_AB_sample.csv     # Representative Marketing A/B dataset sample (Kaggle benchmark)
+│   └── marketing_AB_synthetic.csv  # Generated synthetic fallback dataset (when real CSV is absent)
 │
 ├── reports/
 │   ├── data_quality_log.md         # Generated audit log tracking data hygiene and drops
@@ -111,11 +113,11 @@ streamlit run app/app.py
 ```
 
 The application opens automatically in your browser at `http://localhost:8501` featuring:
-1. **Tab 1: Pre-Registration & Sample Size Calculator**: Compute sample sizes ($N=14,749$ per arm for $\alpha=0.05, 1-\beta=0.80, p_1=0.10, p_2=0.11$) and lock hypothesis text via SHA-256 hash.
-2. **Tab 2: Live Traffic Simulator**: Generate synthetic user cohorts, assign variants deterministically, and store them in SQLite.
-3. **Tab 3: Data Quality & Ingestion**: Upload external CSV datasets, view inspection summaries, and audit cleaning operations.
-4. **Tab 4: Analysis & Decision Engine**: Run two-proportion z-tests, evaluate Sample Ratio Mismatch (SRM), and review plain-English business recommendations (`SHIP_B`, `KEEP_A`, or `INCONCLUSIVE`).
-5. **Tab 5: Educational Simulation Labs**: Interactively reproduce the Peeking Problem and explore A/A test $p$-value uniform distributions.
+1. **1. Plan & Sample Size**: Compute sample sizes ($N=14,749$ per arm for $\alpha=0.05, 1-\beta=0.80, p_1=0.10, p_2=0.11$) and lock the full experiment plan via canonical JSON SHA-256 hash.
+2. **2. Data & Simulation**: Simulate synthetic user cohorts via deterministic SHA-256 assignment (Option A) or upload external CSV datasets with whitespace trimming, case-insensitive outcome parsing, and optional duplicate user ID removal (Option B).
+3. **3. Statistical Verdict**: Run two-proportion z-tests, evaluate Sample Ratio Mismatch (SRM), check normality assumptions, and review plain-English recommendations (`SHIP_B`, `KEEP_A`, or `INCONCLUSIVE`).
+4. **4. Simulation Labs**: Interactively reproduce the Peeking Problem and explore A/A test $p$-value uniform distributions.
+5. **5. SHA-256 Demo**: Preview deterministic SHA-256 variant assignment for any visitor ID, with an opt-in checkbox (off by default) to record demo visitors into the active experiment.
 
 ---
 

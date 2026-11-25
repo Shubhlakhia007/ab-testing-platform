@@ -1,15 +1,17 @@
-"""A/B Testing Interactive Platform.
+"""A/B Testing & Statistical Simulation Platform.
 
-A multi-tab Streamlit application integrating experiment planning, sample size
-sizing, stochastic visitor simulation, CSV upload, SQL-based aggregation,
-classical hypothesis testing, assumption checks, and educational simulations.
+A multi-page Streamlit application integrating experiment pre-registration,
+sample size sizing, stochastic visitor simulation, CSV upload, SQL-based
+aggregation, classical hypothesis testing, assumption checks, and Monte Carlo
+simulation labs.
 """
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-import hashlib
+from itertools import repeat
 import os
+from pathlib import Path
 import random
 import sys
 from typing import Any, Dict, List, Optional, Tuple
@@ -22,21 +24,24 @@ import pandas as pd
 import streamlit as st
 
 # Ensure project root is in sys.path
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from src.assign import assign, assign_and_store
+from src.data_loader import prepare_csv_for_experiment
 from src.db import (
     clear_experiment_data,
     create_experiment,
-    get_connection,
     get_counts,
     get_experiment,
-    hash_hypothesis,
+    get_experiment_by_name,
     init_db,
     list_experiments,
     log_event,
     log_events_batch,
     store_assignments_batch,
+    verify_experiment_hash,
 )
 from src.simulate import aa_test, peeking
 from src.stats_engine import (
@@ -50,7 +55,7 @@ from src.stats_engine import (
 # App Configuration & Page Layout
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="A/B Testing Decision Platform",
+    page_title="A/B Testing & Statistical Simulation Platform",
     page_icon="🧪",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -59,6 +64,14 @@ st.set_page_config(
 # Initialize Database
 conn = init_db()
 
+PAGES = [
+    "1. Plan & Sample Size",
+    "2. Data & Simulation",
+    "3. Statistical Verdict",
+    "4. Simulation Labs",
+    "5. SHA-256 Demo",
+]
+
 # -----------------------------------------------------------------------------
 # Session State Initialization
 # -----------------------------------------------------------------------------
@@ -66,43 +79,84 @@ if "experiment_id" not in st.session_state:
     st.session_state["experiment_id"] = None
 if "is_locked" not in st.session_state:
     st.session_state["is_locked"] = False
+if "creating_new" not in st.session_state:
+    st.session_state["creating_new"] = False
+if "active_page" not in st.session_state or st.session_state["active_page"] not in PAGES:
+    st.session_state["active_page"] = PAGES[0]
 if "demo_visitor_id" not in st.session_state:
     st.session_state["demo_visitor_id"] = 101
+if "demo_logged_views" not in st.session_state:
+    st.session_state["demo_logged_views"] = set()
+if "loaded_sample_df" not in st.session_state:
+    st.session_state["loaded_sample_df"] = None
 
+
+def navigate_to(page: str) -> None:
+    """Switch the active page and rerun."""
+    st.session_state["active_page"] = page
+    st.rerun()
+
+
+# -----------------------------------------------------------------------------
 # Sidebar: Experiment Context & Selector
+# -----------------------------------------------------------------------------
 st.sidebar.title("🧪 Experiment Suite")
+st.sidebar.caption("Pre-registration, SQLite tracking & statistical verification.")
 st.sidebar.markdown("---")
 
 all_exps = list_experiments(conn)
 
 if all_exps:
     exp_options = {f"#{e['id']} - {e['name']}": e["id"] for e in all_exps}
-    selected_label = st.sidebar.selectbox(
-        "Active Experiment",
-        options=list(exp_options.keys()),
-        index=0 if st.session_state["experiment_id"] is None else (
-            list(exp_options.values()).index(st.session_state["experiment_id"])
-            if st.session_state["experiment_id"] in exp_options.values() else 0
-        ),
-    )
-    selected_id = exp_options[selected_label]
-    if st.session_state["experiment_id"] != selected_id:
-        st.session_state["experiment_id"] = selected_id
-        st.session_state["is_locked"] = True
-else:
-    st.sidebar.info("No experiments found. Create and lock one in the **PLAN** tab.")
+    exp_labels = list(exp_options.keys())
+    exp_ids = list(exp_options.values())
 
-if st.sidebar.button("➕ Create New Experiment", use_container_width=True):
+    if st.session_state["creating_new"]:
+        st.sidebar.info("📝 **Drafting a new experiment** in **1. Plan & Sample Size**.")
+        if st.sidebar.button("↩️ Back to Saved Experiments", use_container_width=True):
+            st.session_state["creating_new"] = False
+            st.session_state["experiment_id"] = exp_ids[0]
+            st.session_state["is_locked"] = True
+            st.rerun()
+    else:
+        if st.session_state["experiment_id"] not in exp_ids:
+            st.session_state["experiment_id"] = exp_ids[0]
+            st.session_state["is_locked"] = True
+
+        current_idx = exp_ids.index(st.session_state["experiment_id"])
+        selected_label = st.sidebar.selectbox(
+            "Active Experiment",
+            options=exp_labels,
+            index=current_idx,
+        )
+        selected_id = exp_options[selected_label]
+        if st.session_state["experiment_id"] != selected_id:
+            st.session_state["experiment_id"] = selected_id
+            st.session_state["is_locked"] = True
+            st.rerun()
+
+        if st.sidebar.button("➕ Create New Experiment", use_container_width=True):
+            st.session_state["creating_new"] = True
+            st.session_state["experiment_id"] = None
+            st.session_state["is_locked"] = False
+            st.session_state["active_page"] = PAGES[0]
+            st.rerun()
+else:
+    st.session_state["creating_new"] = True
     st.session_state["experiment_id"] = None
     st.session_state["is_locked"] = False
-    st.rerun()
+    st.sidebar.info(
+        "No saved experiments yet. Fill out **1. Plan & Sample Size** and click "
+        "**Lock Hypothesis & Register Experiment** to create your first one."
+    )
 
 current_exp: Optional[Dict[str, Any]] = None
-if st.session_state["experiment_id"] is not None:
+if not st.session_state["creating_new"] and st.session_state["experiment_id"] is not None:
     current_exp = get_experiment(conn, st.session_state["experiment_id"])
     if current_exp is not None:
         st.session_state["is_locked"] = True
-        st.sidebar.markdown(f"**Status:** 🔒 Locked")
+        st.sidebar.markdown("---")
+        st.sidebar.markdown("**Status:** 🔒 Locked")
         st.sidebar.markdown(f"**Name:** `{current_exp['name']}`")
         st.sidebar.markdown(f"**Planned N:** `{current_exp['planned_n_per_group']:,} / group`")
         st.sidebar.markdown(f"**Target MDE:** `{current_exp['mde'] * 100:.2f}%`")
@@ -112,28 +166,39 @@ if st.session_state["experiment_id"] is not None:
         st.session_state["experiment_id"] = None
         st.session_state["is_locked"] = False
 
-st.title("🧪 Statistical A/B Testing & Decision Engine")
+# -----------------------------------------------------------------------------
+# Header & Top Navigation
+# -----------------------------------------------------------------------------
+st.title("🧪 A/B Testing & Statistical Simulation Platform")
 st.markdown(
-    "A rigorous, end-to-end framework for experiment pre-registration, user assignment, "
-    "stochastic simulation, SRM validation, and frequentist hypothesis testing."
+    "End-to-end statistical experimentation workflow: **Plan & Pre-Register** → **Simulate or Ingest CSV Data** → "
+    "**Evaluate SRM & Hypothesis Verdict**, plus standalone **Monte Carlo Simulation Labs**."
 )
 
-# -----------------------------------------------------------------------------
-# Main Navigation Tabs
-# -----------------------------------------------------------------------------
-tab_plan, tab_data, tab_verdict, tab_learn, tab_demo = st.tabs(
-    ["1. PLAN", "2. DATA", "3. VERDICT", "4. LEARN", "5. DEMO"]
+active_page = st.segmented_control(
+    "Workflow Navigation",
+    options=PAGES,
+    default=st.session_state["active_page"],
+    key="nav_control",
+    label_visibility="collapsed",
 )
+if active_page is not None and active_page != st.session_state["active_page"]:
+    st.session_state["active_page"] = active_page
+    st.rerun()
+
+page = st.session_state["active_page"]
+st.markdown("---")
+
 
 # =============================================================================
-# TAB 1: PLAN
+# PAGE 1: PLAN & SAMPLE SIZE
 # =============================================================================
-with tab_plan:
+if page == PAGES[0]:
     st.header("1. Experiment Planning & Hypothesis Pre-Registration")
     st.markdown(
-        "Define your hypothesis and business decision rule before launching data collection. "
-        "Pre-registering and locking the hypothesis protects against p-hacking, HARKing, "
-        "and arbitrary early-stopping bias."
+        "Define your hypothesis and business decision rule before collecting data. "
+        "Pre-registering and locking the hypothesis with a SHA-256 hash protects against "
+        "p-hacking, HARKing, and early-stopping bias."
     )
 
     is_locked = bool(st.session_state.get("is_locked", False) and current_exp is not None)
@@ -144,15 +209,31 @@ with tab_plan:
             f"was locked at `{current_exp['locked_at']}` UTC."
         )
         st.code(f"Hypothesis SHA-256 Digest:\n{current_exp['hypothesis_hash']}", language="text")
+        if verify_experiment_hash(current_exp):
+            st.caption("🛡️ **Plan integrity: verified** (stored SHA-256 matches all locked plan parameters)")
+        else:
+            st.warning("⚠️ **Plan integrity: mismatch** (record was created with an older hash format or modified)")
+
+        col_next1, col_next2 = st.columns([2, 1])
+        with col_next1:
+            if st.button("➡️ Next: Collect or Simulate Data (Step 2)", type="primary", use_container_width=True):
+                navigate_to(PAGES[1])
+        with col_next2:
+            if st.button("➕ Draft Another Experiment", use_container_width=True):
+                st.session_state["creating_new"] = True
+                st.session_state["experiment_id"] = None
+                st.session_state["is_locked"] = False
+                st.rerun()
 
     col_name, col_rule = st.columns([1, 1])
 
+    default_name = f"ab_experiment_v{len(all_exps) + 1}"
     with col_name:
         exp_name = st.text_input(
             "Experiment Name",
-            value=current_exp["name"] if current_exp else "checkout_redesign_v1",
+            value=current_exp["name"] if current_exp else default_name,
             disabled=is_locked,
-            help="Unique machine-readable identifier for this experiment.",
+            help="Unique machine-readable identifier for this experiment (used as SHA-256 salt).",
         )
 
     with col_rule:
@@ -164,7 +245,7 @@ with tab_plan:
                 else "Ship Variant B if conversion increases by at least 1 percentage point with p < 0.05 and a positive 95% confidence interval; otherwise retain Variant A."
             ),
             disabled=is_locked,
-            help="Helpful Example: Ship Variant B if p-value < 0.05 and the 95% confidence interval lower bound > 0.",
+            help="Example: Ship Variant B if p-value < 0.05 and the 95% confidence interval lower bound > 0.",
             height=100,
         )
 
@@ -173,7 +254,7 @@ with tab_plan:
         value=(
             current_exp["hypothesis"]
             if current_exp
-            else "Replacing the multi-step checkout flow with a simplified 1-click express checkout will increase completion rate from 10% to 11%."
+            else "Treatment (Variant B) will produce a statistically significant increase in conversion rate over Control (Variant A)."
         ),
         disabled=is_locked,
         help="State the expected behavioral change and business mechanism.",
@@ -248,17 +329,23 @@ with tab_plan:
     st.markdown("---")
     if not is_locked:
         if st.button("🔒 Lock Hypothesis & Register Experiment", type="primary", use_container_width=True):
-            if not exp_name.strip():
+            clean_name = exp_name.strip()
+            if not clean_name:
                 st.error("Please enter a valid Experiment Name before locking.")
             elif not hypothesis_text.strip():
                 st.error("Please enter a non-empty Hypothesis before locking.")
             elif req_sample_size <= 0:
                 st.error("Invalid sample size calculation.")
+            elif get_experiment_by_name(conn, clean_name) is not None:
+                st.error(
+                    f"An experiment named `{clean_name}` already exists. "
+                    "Please choose a unique Experiment Name (or select the existing one from the sidebar)."
+                )
             else:
                 now_str = datetime.now(timezone.utc).isoformat()
                 new_id = create_experiment(
                     conn=conn,
-                    name=exp_name.strip(),
+                    name=clean_name,
                     hypothesis=hypothesis_text.strip(),
                     success_rule=success_rule.strip(),
                     baseline_rate=float(baseline_rate),
@@ -268,30 +355,27 @@ with tab_plan:
                     planned_n_per_group=int(req_sample_size),
                     locked_at=now_str,
                 )
-                h_digest = hash_hypothesis(hypothesis_text)
+                st.session_state["creating_new"] = False
                 st.session_state["experiment_id"] = new_id
                 st.session_state["is_locked"] = True
-                st.success(
-                    f"✅ **Experiment Successfully Locked!** Registered as ID #{new_id}. "
-                    f"Timestamp: `{now_str}` UTC."
-                )
-                st.code(f"SHA-256 Digest: {h_digest}", language="text")
                 st.rerun()
     else:
-        st.caption("Hypothesis inputs are locked and read-only. Data collection and analysis tabs are unlocked.")
+        st.caption("Hypothesis inputs are locked and read-only. Use Step 2 (Data) and Step 3 (Verdict) to run your analysis.")
 
 
 # =============================================================================
-# TAB 2: DATA
+# PAGE 2: DATA & SIMULATION
 # =============================================================================
-with tab_data:
+elif page == PAGES[1]:
     st.header("2. Data Collection & Population Ingestion")
 
     if not st.session_state.get("is_locked") or current_exp is None:
         st.warning(
-            "⚠️ **Data tabs are disabled until an experiment is locked.** "
-            "Please go to the **1. PLAN** tab and click 'Lock Hypothesis & Register Experiment'."
+            "⚠️ **No active locked experiment selected.** "
+            "Please create and lock an experiment in **1. Plan & Sample Size** first."
         )
+        if st.button("📝 Go to 1. Plan & Sample Size", type="primary"):
+            navigate_to(PAGES[0])
     else:
         st.markdown(
             f"Populate visitor observations for locked experiment: "
@@ -300,7 +384,7 @@ with tab_data:
 
         data_option = st.radio(
             "Choose Data Source:",
-            ["Option A: Simulate Visitors", "Option B: Upload CSV"],
+            ["Option A: Simulate Visitors", "Option B: Upload CSV / Sample Dataset"],
             horizontal=True,
         )
 
@@ -321,7 +405,7 @@ with tab_data:
                     "Users per Version",
                     min_value=100,
                     max_value=500000,
-                    value=15000,
+                    value=int(current_exp["planned_n_per_group"]),
                     step=1000,
                     help="Sample size to target for each variant (A and B).",
                 )
@@ -330,7 +414,7 @@ with tab_data:
                     "TRUE Rate for A (Control)",
                     min_value=0.001,
                     max_value=0.999,
-                    value=0.10,
+                    value=float(current_exp["baseline_rate"]),
                     step=0.01,
                     format="%.3f",
                 )
@@ -339,7 +423,7 @@ with tab_data:
                     "TRUE Rate for B (Treatment)",
                     min_value=0.001,
                     max_value=0.999,
-                    value=0.11,
+                    value=min(0.999, float(current_exp["baseline_rate"]) + float(current_exp["mde"])),
                     step=0.01,
                     format="%.3f",
                 )
@@ -374,7 +458,6 @@ with tab_data:
                 exp_name = current_exp["name"]
                 now_iso = datetime.now(timezone.utc).isoformat()
 
-                # Clear previous data to avoid double counting across simulation runs
                 clear_experiment_data(conn, exp_id)
 
                 progress_bar = st.progress(0.0)
@@ -388,7 +471,6 @@ with tab_data:
                     chunk_uids = list(range(start_idx, end_idx))
                     chunk_len = len(chunk_uids)
 
-                    # For large n (>20,000) batch operations; otherwise call assign_and_store per user
                     if total_sim_users > 20000:
                         variants = [assign(uid, exp_name) for uid in chunk_uids]
                         assignments = [
@@ -432,54 +514,93 @@ with tab_data:
                     f"Variant A: {counts['n_a']:,} visitors, {counts['x_a']:,} orders ({counts['conv_a'] * 100:.2f}%). "
                     f"Variant B: {counts['n_b']:,} visitors, {counts['x_b']:,} orders ({counts['conv_b'] * 100:.2f}%)."
                 )
-                st.info("👉 Switch to the **3. VERDICT** tab to view hypothesis test results and decision cards.")
+
+            counts_now = get_counts(conn, current_exp["id"])
+            if counts_now["total_users"] > 0:
+                if st.button("➡️ Next: View Statistical Verdict (Step 3)", type="primary", use_container_width=True):
+                    navigate_to(PAGES[2])
 
         # ---------------------------------------------------------------------
-        # OPTION B: UPLOAD CSV
+        # OPTION B: UPLOAD CSV / SAMPLE DATASET
         # ---------------------------------------------------------------------
         else:
-            st.subheader("Option B: Upload External Dataset (CSV)")
+            st.subheader("Option B: Upload External Dataset (CSV) or Load Sample")
             st.markdown(
-                "Upload a CSV file containing experiment records. Map columns to group variants "
-                "and conversion flags without relying on hardcoded column names."
+                "Upload a CSV file containing experiment records, or load the project's built-in "
+                "sample dataset (`data/marketing_AB_synthetic.csv` or `data/marketing_AB_sample.csv`)."
             )
 
-            uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+            synth_csv_path = PROJECT_ROOT / "data" / "marketing_AB_synthetic.csv"
+            legacy_sample_path = PROJECT_ROOT / "data" / "marketing_AB_sample.csv"
+            sample_csv_path = synth_csv_path if synth_csv_path.exists() else legacy_sample_path
+            col_up1, col_up2 = st.columns([2, 1])
+            with col_up1:
+                uploaded_file = st.file_uploader("Upload CSV File", type=["csv"])
+            with col_up2:
+                if sample_csv_path.exists():
+                    st.write("&nbsp;")
+                    if st.button("📂 Load Built-in Sample CSV", use_container_width=True):
+                        with st.spinner(f"Loading {sample_csv_path.name}..."):
+                            st.session_state["loaded_sample_df"] = pd.read_csv(sample_csv_path, low_memory=False)
 
+            df: Optional[pd.DataFrame] = None
             if uploaded_file is not None:
+                df = pd.read_csv(uploaded_file, low_memory=False)
+                st.session_state["loaded_sample_df"] = None
+            elif st.session_state.get("loaded_sample_df") is not None:
+                df = st.session_state["loaded_sample_df"]
+
+            if df is not None:
                 try:
-                    df = pd.read_csv(uploaded_file)
                     st.markdown(f"**Loaded Preview:** `{df.shape[0]:,}` rows × `{df.shape[1]}` columns")
                     st.dataframe(df.head(5), use_container_width=True)
 
-                    col_m1, col_m2 = st.columns(2)
+                    cols_list = list(df.columns)
+                    default_grp_idx = cols_list.index("test group") if "test group" in cols_list else 0
+                    default_conv_idx = cols_list.index("converted") if "converted" in cols_list else min(1, len(cols_list) - 1)
+
+                    col_m1, col_m2, col_m3 = st.columns(3)
                     with col_m1:
                         group_col = st.selectbox(
                             "Select Group / Variant Column",
-                            options=df.columns,
-                            index=0,
+                            options=cols_list,
+                            index=default_grp_idx,
                         )
                     with col_m2:
                         conv_col = st.selectbox(
                             "Select Converted / Outcome Column",
-                            options=df.columns,
-                            index=min(1, len(df.columns) - 1),
+                            options=cols_list,
+                            index=default_conv_idx,
                         )
+                    with col_m3:
+                        uid_options = ["<Use row number>"] + cols_list
+                        selected_uid_opt = st.selectbox(
+                            "User ID Column (optional)",
+                            options=uid_options,
+                            index=0,
+                            help="If chosen, duplicate user IDs are dropped (keeping first).",
+                        )
+                        user_id_col = None if selected_uid_opt == "<Use row number>" else selected_uid_opt
 
-                    unique_groups = df[group_col].dropna().unique().tolist()
+                    # Strip whitespace and ignore blank labels before building group choices.
+                    raw_groups = df[group_col].dropna().astype(str).str.strip()
+                    cleaned_groups = [g for g in raw_groups.unique().tolist() if g != ""]
+                    default_a_idx = cleaned_groups.index("psa") if "psa" in cleaned_groups else 0
+                    default_b_idx = cleaned_groups.index("ad") if "ad" in cleaned_groups else (1 if len(cleaned_groups) > 1 else 0)
+
                     st.markdown("##### Value Mapping")
                     col_v1, col_v2 = st.columns(2)
                     with col_v1:
                         val_a = st.selectbox(
                             "Value representing Variant A (Control)",
-                            options=unique_groups,
-                            index=0 if unique_groups else 0,
+                            options=cleaned_groups,
+                            index=default_a_idx,
                         )
                     with col_v2:
                         val_b = st.selectbox(
                             "Value representing Variant B (Treatment)",
-                            options=unique_groups,
-                            index=1 if len(unique_groups) > 1 else 0,
+                            options=cleaned_groups,
+                            index=default_b_idx,
                         )
 
                     clear_before_import = st.checkbox(
@@ -492,61 +613,79 @@ with tab_data:
                         if clear_before_import:
                             clear_experiment_data(conn, exp_id)
 
-                        now_iso = datetime.now(timezone.utc).isoformat()
-                        sub_df = df[[group_col, conv_col]].dropna()
+                        with st.spinner("Cleaning and ingesting CSV rows..."):
+                            now_iso = datetime.now(timezone.utc).isoformat()
+                            uids, variant_arr, conv_bool, ingest_stats = prepare_csv_for_experiment(
+                                df=df,
+                                group_col=group_col,
+                                conv_col=conv_col,
+                                val_a=val_a,
+                                val_b=val_b,
+                                user_id_col=user_id_col,
+                            )
 
-                        assignments: List[Tuple[int, int, str, str]] = []
-                        view_events: List[Tuple[int, int, str, str]] = []
-                        order_events: List[Tuple[int, int, str, str]] = []
+                            # Vectorized tuple list construction via zip + repeat for 588k+ row speed.
+                            uids_list = uids.tolist()
+                            variants_list = variant_arr.tolist()
+                            assignments = list(zip(uids_list, repeat(exp_id), variants_list, repeat(now_iso)))
+                            view_events = list(zip(uids_list, repeat(exp_id), repeat("view_checkout"), repeat(now_iso)))
+                            order_uids = uids[conv_bool].tolist()
+                            order_events = list(zip(order_uids, repeat(exp_id), repeat("order_complete"), repeat(now_iso)))
 
-                        # Identify conversion boolean values
-                        positive_conv = {1, "1", True, "True", "true", "yes", "Y", "converted"}
-
-                        for idx, row in sub_df.iterrows():
-                            uid = int(idx) + 1
-                            raw_grp = row[group_col]
-                            if raw_grp == val_a:
-                                var = "A"
-                            elif raw_grp == val_b:
-                                var = "B"
-                            else:
-                                continue
-
-                            assignments.append((uid, exp_id, var, now_iso))
-                            view_events.append((uid, exp_id, "view_checkout", now_iso))
-
-                            raw_conv = row[conv_col]
-                            if raw_conv in positive_conv or (
-                                isinstance(raw_conv, (int, float)) and raw_conv > 0
-                            ):
-                                order_events.append((uid, exp_id, "order_complete", now_iso))
-
-                        store_assignments_batch(conn, assignments)
-                        log_events_batch(conn, view_events)
-                        log_events_batch(conn, order_events)
+                            store_assignments_batch(conn, assignments)
+                            log_events_batch(conn, view_events)
+                            log_events_batch(conn, order_events)
 
                         counts = get_counts(conn, exp_id)
                         st.success(
-                            f"🎉 Ingested **{counts['total_users']:,} records** from CSV! "
+                            f"🎉 Ingested **{counts['total_users']:,} records** from CSV "
+                            f"(out of {ingest_stats['total_rows']:,} rows)! "
                             f"Variant A: {counts['n_a']:,} users ({counts['x_a']:,} conversions). "
                             f"Variant B: {counts['n_b']:,} users ({counts['x_b']:,} conversions)."
                         )
-                        st.info("👉 Check the **3. VERDICT** tab for statistical analysis.")
+
+                        skipped_parts = []
+                        if ingest_stats["skipped_blank"] > 0:
+                            skipped_parts.append(f"{ingest_stats['skipped_blank']:,} blank/missing values")
+                        if ingest_stats["skipped_other_groups"] > 0:
+                            skipped_parts.append(f"{ingest_stats['skipped_other_groups']:,} other group labels")
+                        if ingest_stats["skipped_unparseable"] > 0:
+                            skipped_parts.append(f"{ingest_stats['skipped_unparseable']:,} unparseable outcomes")
+                        if ingest_stats["dropped_duplicate_users"] > 0:
+                            skipped_parts.append(f"{ingest_stats['dropped_duplicate_users']:,} duplicate user IDs")
+
+                        if skipped_parts:
+                            total_skipped = (
+                                ingest_stats["skipped_blank"]
+                                + ingest_stats["skipped_other_groups"]
+                                + ingest_stats["skipped_unparseable"]
+                                + ingest_stats["dropped_duplicate_users"]
+                            )
+                            st.info(
+                                f"ℹ️ **Skipped / Dropped {total_skipped:,} rows:** " + ", ".join(skipped_parts) + "."
+                            )
+
+                    counts_now = get_counts(conn, current_exp["id"])
+                    if counts_now["total_users"] > 0:
+                        if st.button("➡️ Next: View Statistical Verdict (Step 3)", type="primary", use_container_width=True):
+                            navigate_to(PAGES[2])
                 except Exception as ex:
-                    st.error(f"Error parsing uploaded file: {ex}")
+                    st.error(f"Error parsing dataset: {ex}")
 
 
 # =============================================================================
-# TAB 3: VERDICT
+# PAGE 3: STATISTICAL VERDICT
 # =============================================================================
-with tab_verdict:
+elif page == PAGES[2]:
     st.header("3. Statistical Verdict & Decision Card")
 
     if not st.session_state.get("is_locked") or current_exp is None:
         st.warning(
-            "⚠️ **Verdict tab is disabled until an experiment is locked.** "
-            "Please go to the **1. PLAN** tab to configure and lock your hypothesis."
+            "⚠️ **No active locked experiment selected.** "
+            "Please create and lock an experiment in **1. Plan & Sample Size**."
         )
+        if st.button("📝 Go to 1. Plan & Sample Size", type="primary"):
+            navigate_to(PAGES[0])
     else:
         exp_id = current_exp["id"]
         counts = get_counts(conn, exp_id)
@@ -558,14 +697,15 @@ with tab_verdict:
 
         if total_users == 0:
             st.info(
-                "ℹ️ **No visitor data logged yet.** "
-                "Simulate visitor traffic or upload a CSV in the **2. DATA** tab to compute the verdict."
+                "ℹ️ **No visitor data logged yet for this experiment.** "
+                "Simulate visitor traffic or upload a CSV in **2. Data & Simulation** to compute the verdict."
             )
+            if st.button("📊 Go to 2. Data & Simulation", type="primary"):
+                navigate_to(PAGES[1])
         else:
             exp_alpha = float(current_exp["alpha"])
             planned_n = int(current_exp["planned_n_per_group"])
 
-            # Run core statistical engine functions
             test_res = two_prop_test(x_a, n_a, x_b, n_b, alpha=exp_alpha)
             srm_res = sample_ratio_check(n_a, n_b)
             decide_res = decide(test_res, planned_n_per_group=planned_n, n_a=n_a, n_b=n_b)
@@ -602,7 +742,7 @@ with tab_verdict:
 
             st.markdown("---")
 
-            # 2. Key Statistical Tests with mandatory side-by-side presentation
+            # 2. Key Statistical Tests
             st.subheader("Classical Hypothesis Test Results")
             c_p, c_ci, c_h = st.columns(3)
 
@@ -622,8 +762,7 @@ with tab_verdict:
                     st.markdown(
                         "The **p-value** measures the probability of observing a conversion difference "
                         "at least as large as the one seen, assuming the true difference between variants is zero (null hypothesis). "
-                        "\n\n**Common Pitfall:** The p-value is **NOT** the probability that Variant B is better than Variant A. "
-                        "A p-value below α (typically 0.05) indicates the observed difference is unlikely due to chance alone."
+                        "\n\n**Common Pitfall:** The p-value is **NOT** the probability that Variant B is better than Variant A."
                     )
 
             with c_ci:
@@ -636,8 +775,7 @@ with tab_verdict:
                 with st.expander("❓ What does this interval mean?"):
                     st.markdown(
                         f"We are **{(1.0 - exp_alpha) * 100:.0f}% confident** that the true population lift "
-                        f"lies between **{test_res['ci_low'] * 100:+.2f}%** and **{test_res['ci_high'] * 100:+.2f}%**. "
-                        "\n\nIf the entire interval sits strictly above zero, Variant B provides a guaranteed positive gain within tolerance."
+                        f"lies between **{test_res['ci_low'] * 100:+.2f}%** and **{test_res['ci_high'] * 100:+.2f}%**."
                     )
 
             with c_h:
@@ -657,14 +795,10 @@ with tab_verdict:
                 with st.expander("❓ What does Cohen's h mean?"):
                     st.markdown(
                         "**Cohen's h** measures the standardized magnitude of the difference between two proportions, "
-                        "independent of sample size. \n\n"
-                        "- **|h| < 0.2**: Small effect\n"
-                        "- **|h| ≈ 0.5**: Medium effect\n"
-                        "- **|h| > 0.8**: Large effect\n\n"
-                        "In high-traffic e-commerce, small effect sizes (e.g. h = 0.03) can still deliver substantial revenue."
+                        "independent of sample size."
                     )
 
-            # 3. Simple Confidence Interval Chart with Line at Zero
+            # 3. Confidence Interval Chart
             st.subheader("Confidence Interval Visualization")
             fig, ax = plt.subplots(figsize=(8.5, 2.2), dpi=200)
 
@@ -696,7 +830,6 @@ with tab_verdict:
                 label="Zero Effect Line (p_B = p_A)",
             )
 
-            # Dynamic x-limits
             margin = max(abs(ci_high_pct - ci_low_pct) * 0.4, 0.5)
             x_min = min(-0.5, ci_low_pct - margin)
             x_max = max(0.5, ci_high_pct + margin)
@@ -747,19 +880,17 @@ with tab_verdict:
                         + "\n".join(f"- {note}" for note in test_res["assumption_notes"])
                     )
 
-            # 5. Prominent Early-Stopping Warning if sample size < planned
+            # 5. Early-Stopping Warning
             min_observed_n = min(n_a, n_b)
             if min_observed_n < planned_n:
                 st.warning(
-                    f"⚠️ **PROMINENT EARLY-STOPPING WARNING (PEEKING PROBLEM)**\n\n"
-                    f"The experiment collected fewer users per variant than the planned pre-registered sample size: "
-                    f"**{min_observed_n:,} observed** vs. **{planned_n:,} planned per version** "
+                    f"⚠️ **EARLY-STOPPING WARNING (PEEKING PROBLEM)**\n\n"
+                    f"Observed **{min_observed_n:,}** vs. **{planned_n:,} planned per version** "
                     f"({(min_observed_n / float(planned_n)) * 100:.1f}% of target reached). "
-                    f"Stopping or deciding early without an alpha-spending function severely inflates false-positive rates. "
-                    f"Treat these results as preliminary and continue data collection."
+                    f"Stopping early without an alpha-spending function inflates false-positive rates."
                 )
 
-            # 6. Decision Card from decide()
+            # 6. Decision Card
             st.subheader("Business Decision & Recommendation")
             dec_code = decide_res["decision"]
 
@@ -781,26 +912,22 @@ with tab_verdict:
 
 
 # =============================================================================
-# TAB 4: LEARN
+# PAGE 4: SIMULATION LABS
 # =============================================================================
-with tab_learn:
-    st.header("4. Learn: Statistical Verification & Simulation")
+elif page == PAGES[3]:
+    st.header("4. Monte Carlo Simulation Labs")
     st.markdown(
-        "Interactive Monte Carlo simulations demonstrating the foundational concepts of classical A/B testing: "
-        "A/A calibration and the destructive effects of optional stopping (the peeking problem)."
+        "Standalone interactive Monte Carlo simulations verifying the mathematical foundations of A/B testing "
+        "(no locked experiment required): **A/A p-value calibration** and **optional-stopping α inflation**."
     )
 
     tab_aa, tab_peek = st.tabs(["A/A Test Calibration", "The Peeking Problem"])
 
-    # -------------------------------------------------------------------------
-    # SUBTAB: A/A TEST
-    # -------------------------------------------------------------------------
     with tab_aa:
         st.subheader("A/A Test: P-Value Uniformity under H₀")
         st.markdown(
-            "When testing two identical variants (Variant A vs. Variant A), the null hypothesis is completely true. "
-            "Under H₀, p-values must follow a **Uniform(0, 1)** distribution, resulting in a flat histogram. "
-            "Exactly ~5% of p-values should fall below α = 0.05 purely by random sampling noise."
+            "When testing two identical variants (p_A = p_B), the null hypothesis is true. "
+            "Under H₀, p-values must follow a **Uniform(0, 1)** distribution, with ~5% falling below α = 0.05."
         )
 
         col_aa1, col_aa2, col_aa3 = st.columns(3)
@@ -832,7 +959,7 @@ with tab_learn:
 
             fig, ax = plt.subplots(figsize=(8, 4.5), dpi=200)
             bins = np.linspace(0.0, 1.0, 21)
-            counts, edges, patches = ax.hist(
+            counts_hist, edges, patches = ax.hist(
                 p_vals,
                 bins=bins,
                 color="#3B82F6",
@@ -872,21 +999,11 @@ with tab_learn:
             st.pyplot(fig)
             plt.close(fig)
 
-            st.caption(
-                f"Caption: Under the null hypothesis (A/A test), p-values are uniformly distributed between 0 and 1, "
-                f"with {frac_sig * 100:.1f}% falling below α = 0.05 (expected 5.0% ± binomial sampling noise)."
-            )
-
-    # -------------------------------------------------------------------------
-    # SUBTAB: PEEKING PROBLEM
-    # -------------------------------------------------------------------------
     with tab_peek:
         st.subheader("The Peeking Problem: False Positive Inflation")
         st.markdown(
             "Continuously checking p-values as visitors arrive and stopping when p < 0.05 "
-            "drastically increases the probability of declaring a false winner. "
-            "Without adjusting the significance threshold (e.g. via O'Brien-Fleming or Pocock boundaries), "
-            "Type I error rates quickly exceed 20% to 30%."
+            "drastically inflates the Type I error rate beyond the nominal 5% threshold."
         )
 
         col_pk1, col_pk2, col_pk3 = st.columns(3)
@@ -949,31 +1066,35 @@ with tab_learn:
             st.pyplot(fig)
             plt.close(fig)
 
-            st.caption(
-                f"Caption: Repeatedly evaluating accumulating data daily without correction inflates the false-positive rate "
-                f"from {rates[0]:.1f}% on Day 1 to {final_fpr:.1f}% by Day {len(peeks)}, far exceeding the intended 5% risk."
-            )
-
 
 # =============================================================================
-# TAB 5: DEMO
+# PAGE 5: SHA-256 DEMO
 # =============================================================================
-with tab_demo:
-    st.header("5. Live Variant Assignment & Interactive Checkout Demo")
+elif page == PAGES[4]:
+    st.header("5. Live SHA-256 Variant Assignment Demo")
 
     if not st.session_state.get("is_locked") or current_exp is None:
         st.warning(
-            "⚠️ **Demo tab is disabled until an experiment is locked.** "
-            "Please lock an experiment in the **1. PLAN** tab to test live user assignments."
+            "⚠️ **No active locked experiment selected.** "
+            "Please lock an experiment in **1. Plan & Sample Size** to test live user assignments."
         )
+        if st.button("📝 Go to 1. Plan & Sample Size", type="primary"):
+            navigate_to(PAGES[0])
     else:
         exp_id = current_exp["id"]
         exp_name = current_exp["name"]
 
         st.markdown(
             "Test deterministic user assignment in real-time. Enter a Visitor ID or generate a random one. "
-            "The app deterministically hashes `{experiment_name}-{user_id}` via SHA-256 to assign the visitor "
-            "to Variant A or B, renders the corresponding page, and logs conversion events upon clicking."
+            "The platform hashes `{experiment_name}-{user_id}` via SHA-256 to deterministically assign "
+            "Variant A or B."
+        )
+
+        # Default OFF so browsing the demo tab does not pollute real experiment data.
+        record_demo = st.checkbox(
+            "Record demo visitors in this experiment's data",
+            value=False,
+            help="When off, only previews which variant the visitor would receive without writing to the database.",
         )
 
         col_id_input, col_id_rand = st.columns([3, 1])
@@ -990,23 +1111,29 @@ with tab_demo:
         with col_id_rand:
             st.write("&nbsp;")
             if st.button("🎲 Random Visitor ID", use_container_width=True):
-                rand_id = random.randint(1000, 99999)
-                st.session_state["demo_visitor_id"] = rand_id
+                st.session_state["demo_visitor_id"] = random.randint(1000, 99999)
                 st.rerun()
 
         active_uid = int(st.session_state["demo_visitor_id"])
-        # Deterministically assign visitor
         assigned_variant = assign(active_uid, exp_name)
 
-        # Log checkout view event
-        now_iso = datetime.now(timezone.utc).isoformat()
-        assign_and_store(conn, active_uid, exp_id, exp_name)
-        log_event(conn, active_uid, exp_id, "view_checkout", now_iso)
-
         st.markdown("---")
-        st.subheader(f"Visitor View: User #{active_uid} assigned to **Variant {assigned_variant}**")
+        st.subheader(f"Visitor Preview: User #{active_uid} → **Variant {assigned_variant}**")
 
-        # Render corresponding mock UI
+        # When recording is enabled, log view_checkout once per (experiment, visitor) per session.
+        if record_demo:
+            visit_key = (exp_id, active_uid)
+            if visit_key not in st.session_state["demo_logged_views"]:
+                now_iso = datetime.now(timezone.utc).isoformat()
+                assign_and_store(conn, active_uid, exp_id, exp_name)
+                log_event(conn, active_uid, exp_id, "view_checkout", now_iso)
+                st.session_state["demo_logged_views"].add(visit_key)
+                st.caption(f"Recorded `view_checkout` for User #{active_uid} in Variant {assigned_variant}.")
+            else:
+                st.caption(f"Visitor #{active_uid} already recorded in this session (no duplicate `view_checkout` logged).")
+        else:
+            st.caption("Preview mode only — database recording is OFF.")
+
         if assigned_variant == "A":
             with st.container(border=True):
                 st.markdown("### 🛒 Standard Checkout (Variant A - Control)")
@@ -1018,8 +1145,14 @@ with tab_demo:
                 with c_cvc:
                     st.text_input("CVC", value="123", disabled=True)
 
-                if st.button("Complete Purchase ($49.00)", type="secondary", key="btn_order_a"):
-                    log_event(conn, active_uid, exp_id, "order_complete", datetime.now(timezone.utc).isoformat())
+                if st.button("Complete Purchase ($49.00)", type="secondary", key="btn_order_a", disabled=not record_demo):
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    visit_key = (exp_id, active_uid)
+                    if visit_key not in st.session_state["demo_logged_views"]:
+                        assign_and_store(conn, active_uid, exp_id, exp_name)
+                        log_event(conn, active_uid, exp_id, "view_checkout", now_iso)
+                        st.session_state["demo_logged_views"].add(visit_key)
+                    log_event(conn, active_uid, exp_id, "order_complete", now_iso)
                     st.balloons()
                     st.success(f"🎉 Order Completed! Recorded conversion event for User #{active_uid} in Variant A.")
         else:
@@ -1029,8 +1162,14 @@ with tab_demo:
                 st.markdown(
                     "🔒 **256-Bit SSL Encrypted** | ⭐ **4.9/5 Rating (12k reviews)** | 🚚 **Free Express Delivery**"
                 )
-                if st.button("⚡ Instant 1-Click Purchase ($49.00)", type="primary", key="btn_order_b"):
-                    log_event(conn, active_uid, exp_id, "order_complete", datetime.now(timezone.utc).isoformat())
+                if st.button("⚡ Instant 1-Click Purchase ($49.00)", type="primary", key="btn_order_b", disabled=not record_demo):
+                    now_iso = datetime.now(timezone.utc).isoformat()
+                    visit_key = (exp_id, active_uid)
+                    if visit_key not in st.session_state["demo_logged_views"]:
+                        assign_and_store(conn, active_uid, exp_id, exp_name)
+                        log_event(conn, active_uid, exp_id, "view_checkout", now_iso)
+                        st.session_state["demo_logged_views"].add(visit_key)
+                    log_event(conn, active_uid, exp_id, "order_complete", now_iso)
                     st.balloons()
                     st.success(f"🎉 Order Completed! Recorded conversion event for User #{active_uid} in Variant B.")
 

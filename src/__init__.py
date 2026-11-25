@@ -14,6 +14,7 @@ from src.db import (
     log_event,
     log_events_batch,
     store_assignments_batch,
+    verify_experiment_hash,
 )
 from src.simulate import (
     aa_test,
@@ -56,4 +57,5 @@ __all__ = [
     "clear_experiment_data",
     "get_counts",
     "hash_hypothesis",
+    "verify_experiment_hash",
 ]

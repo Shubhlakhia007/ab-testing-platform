@@ -12,6 +12,9 @@ env/
 
 # SQLite databases & temp data
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite3
 
 # Distribution / builds

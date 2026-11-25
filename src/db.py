@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import hashlib
+import hmac
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -94,9 +96,46 @@ def init_db(db_path: str = DEFAULT_DB_PATH) -> sqlite3.Connection:
     return conn
 
 
-def hash_hypothesis(hypothesis_text: str) -> str:
-    """Compute SHA-256 hex digest of hypothesis text."""
-    return hashlib.sha256(hypothesis_text.strip().encode("utf-8")).hexdigest()
+def hash_hypothesis(
+    hypothesis_text: str,
+    name: str = "",
+    success_rule: str = "",
+    baseline_rate: Optional[float] = None,
+    mde: Optional[float] = None,
+    alpha: Optional[float] = None,
+    power: Optional[float] = None,
+    planned_n_per_group: Optional[int] = None,
+) -> str:
+    """Compute SHA-256 hex digest of a canonical JSON (sorted keys) of the experiment plan."""
+    # Hash all locked plan parameters so any post-hoc change to thresholds or rules alters the digest.
+    payload = {
+        "alpha": float(alpha) if alpha is not None else None,
+        "baseline_rate": float(baseline_rate) if baseline_rate is not None else None,
+        "hypothesis": hypothesis_text.strip(),
+        "mde": float(mde) if mde is not None else None,
+        "name": name.strip(),
+        "planned_n_per_group": int(planned_n_per_group) if planned_n_per_group is not None else None,
+        "power": float(power) if power is not None else None,
+        "success_rule": (success_rule or "").strip(),
+    }
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def verify_experiment_hash(experiment: Dict[str, Any]) -> bool:
+    """Verify a stored experiment record against its SHA-256 hypothesis_hash."""
+    expected = hash_hypothesis(
+        hypothesis_text=str(experiment.get("hypothesis", "")),
+        name=str(experiment.get("name", "")),
+        success_rule=str(experiment.get("success_rule") or ""),
+        baseline_rate=experiment.get("baseline_rate"),
+        mde=experiment.get("mde"),
+        alpha=experiment.get("alpha"),
+        power=experiment.get("power"),
+        planned_n_per_group=experiment.get("planned_n_per_group"),
+    )
+    stored = str(experiment.get("hypothesis_hash", ""))
+    return hmac.compare_digest(expected, stored)
 
 
 def create_experiment(
@@ -133,7 +172,16 @@ def create_experiment(
     if locked_at is None:
         locked_at = datetime.now(timezone.utc).isoformat()
 
-    h_hash = hash_hypothesis(hypothesis)
+    h_hash = hash_hypothesis(
+        hypothesis_text=hypothesis,
+        name=name,
+        success_rule=success_rule,
+        baseline_rate=baseline_rate,
+        mde=mde,
+        alpha=alpha,
+        power=power,
+        planned_n_per_group=planned_n_per_group,
+    )
     cursor = conn.cursor()
 
     cursor.execute("SELECT id FROM experiments WHERE name = ?", (name.strip(),))

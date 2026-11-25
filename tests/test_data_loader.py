@@ -16,6 +16,8 @@ from src.data_loader import (
     inspect_data,
     load_clean_and_test,
     map_groups,
+    parse_conversion_series,
+    prepare_csv_for_experiment,
     run_ab_analysis,
     write_data_quality_log,
 )
@@ -191,3 +193,49 @@ def test_load_clean_and_test_csv_buffer(tmp_path: Path) -> None:
     assert results["x_a"] == 1
     assert results["x_b"] == 3
     assert log_file.exists()
+
+
+def test_parse_conversion_series_variants_and_unparseable() -> None:
+    """Verify case-insensitive conversion parsing and unparseable counting."""
+    s = pd.Series(["Yes", "TRUE", "t", 1, 0, "0", "maybe", "invalid", None])
+    parsed, unparseable_count = parse_conversion_series(s)
+
+    assert unparseable_count == 2
+    assert parsed.iloc[0] == 1.0
+    assert parsed.iloc[1] == 1.0
+    assert parsed.iloc[2] == 1.0
+    assert parsed.iloc[3] == 1.0
+    assert parsed.iloc[4] == 0.0
+    assert parsed.iloc[5] == 0.0
+    assert pd.isna(parsed.iloc[6])
+    assert pd.isna(parsed.iloc[7])
+    assert pd.isna(parsed.iloc[8])
+
+
+def test_prepare_csv_for_experiment_whitespace_duplicates_and_skips() -> None:
+    """Verify whitespace stripping, duplicate user ID dropping, and skip counts."""
+    df = pd.DataFrame({
+        "uid": [10, 10, 20, 30, 40, 50, 60],
+        "grp": [" psa ", "psa", " ad ", "other", "psa", "  ", "ad"],
+        "conv": ["Yes", "t", "TRUE", "1", "maybe", "1", "0"],
+    })
+
+    uids, variants, conv_bool, stats = prepare_csv_for_experiment(
+        df=df,
+        group_col="grp",
+        conv_col="conv",
+        val_a="psa",
+        val_b="ad",
+        user_id_col="uid",
+    )
+
+    assert stats["total_rows"] == 7
+    assert stats["skipped_blank"] == 1        # row with "  " group
+    assert stats["skipped_other_groups"] == 1 # row with "other"
+    assert stats["skipped_unparseable"] == 1  # row with "maybe"
+    assert stats["dropped_duplicate_users"] == 1  # second uid=10
+    assert stats["ingested_rows"] == 3
+
+    assert uids.tolist() == [10, 20, 60]
+    assert variants.tolist() == ["A", "B", "B"]
+    assert conv_bool.tolist() == [True, True, False]

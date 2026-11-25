@@ -1,6 +1,6 @@
 # %% [markdown]
 # # Marketing A/B Testing Analysis: Kaggle Dataset
-# 
+#
 # This notebook-style script executes an end-to-end A/B test evaluation pipeline
 # on the Kaggle "Marketing A/B Testing" dataset without hardcoded column assumptions.
 #
@@ -16,10 +16,9 @@
 from __future__ import annotations
 
 import argparse
-import os
 from pathlib import Path
 import sys
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -34,23 +33,11 @@ from src.data_loader import (
     inspect_data,
     map_groups,
     run_ab_analysis,
-    write_data_quality_log,
 )
-from src.stats_engine import decide, sample_ratio_check, two_prop_test
 
-print("Environment initialized successfully.")
-
-# %% [markdown]
-# ## 1. Dataset Parameters & File Configuration
-# 
-# Configure file paths and column names below.
-# Do NOT assume hardcoded column names; configure them here according to your file.
-
-# %%
 # Candidate paths for the Kaggle Marketing dataset
 DATA_DIR = PROJECT_ROOT / "data"
 REPORTS_DIR = PROJECT_ROOT / "reports"
-REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
 DEFAULT_CANDIDATE_PATHS = [
     DATA_DIR / "marketing_AB.csv",
@@ -59,20 +46,12 @@ DEFAULT_CANDIDATE_PATHS = [
     PROJECT_ROOT / "marketing_AB.csv",
 ]
 
-# Set your dataset path here, or specify via command line / environment variable
-CSV_FILE_PATH: Optional[Path] = None
-for candidate in DEFAULT_CANDIDATE_PATHS:
-    if candidate.exists():
-        CSV_FILE_PATH = candidate
-        break
-
 # Column name parameters (customize these to match your exact CSV headers)
-GROUP_COL = "test group"      # Group/variant column (e.g. 'test group', 'group', 'campaign_arm')
-CONVERTED_COL = "converted"   # Conversion column (e.g. 'converted', 'conversion', 'is_converted')
-USER_ID_COL = "user id"       # User identifier column (e.g. 'user id', 'user_id', 'id')
+GROUP_COL = "test group"
+CONVERTED_COL = "converted"
+USER_ID_COL = "user id"
 
 # Group mapping: control MUST map to 'A', treatment to 'B'
-# In the Kaggle dataset, 'psa' (Public Service Announcement) is the control, and 'ad' is treatment.
 GROUP_MAPPING: Dict[str, str] = {
     "psa": "A",
     "ad": "B",
@@ -80,27 +59,38 @@ GROUP_MAPPING: Dict[str, str] = {
 
 ALPHA = 0.05
 LOG_PATH = REPORTS_DIR / "data_quality_log.md"
+SYNTHETIC_NOTICE = "SYNTHETIC DATA, NOT THE REAL KAGGLE FILE"
 
-print(f"Target CSV Path      : {CSV_FILE_PATH if CSV_FILE_PATH else 'None found yet (will use sample generator)'}")
-print(f"Configured Group Col : '{GROUP_COL}'")
-print(f"Configured Conv Col  : '{CONVERTED_COL}'")
-print(f"Configured User ID   : '{USER_ID_COL}'")
-print(f"Group Mapping        : {GROUP_MAPPING}")
 
-# %% [markdown]
-# ## 2. Load or Synthesize Dataset
-# 
-# If you haven't downloaded `marketing_AB.csv` into `data/`, a synthetic dataset
-# matching the exact distribution of the Kaggle dataset will be generated
-# so this script runs seamlessly out-of-the-box.
+def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
+    """Parse CLI arguments for the marketing A/B test runner."""
+    parser = argparse.ArgumentParser(
+        description="Run end-to-end A/B testing pipeline on a Marketing A/B CSV dataset."
+    )
+    parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help="Optional path to the Marketing A/B Testing CSV dataset.",
+    )
+    return parser.parse_args(argv)
 
-# %%
-if CSV_FILE_PATH is not None and CSV_FILE_PATH.exists():
-    print(f"Reading CSV from: {CSV_FILE_PATH}")
-    raw_df = pd.read_csv(CSV_FILE_PATH)
-else:
-    print("Notice: No local CSV found at default paths.")
-    print("Generating representative synthetic dataset matching Kaggle distributions (N=588,829)...")
+
+def _resolve_csv_path(csv_arg: Optional[Path]) -> Optional[Path]:
+    """Return explicit --csv path if given, else search default candidate paths."""
+    if csv_arg is not None:
+        if not csv_arg.exists():
+            raise FileNotFoundError(f"Specified --csv file not found: {csv_arg}")
+        return csv_arg
+
+    for candidate in DEFAULT_CANDIDATE_PATHS:
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _generate_synthetic_dataset(output_path: Path) -> pd.DataFrame:
+    """Generate a representative synthetic dataset matching Kaggle distributions."""
     np.random.seed(42)
     n_total = 588_829
     n_psa = 23_524   # ~4% control
@@ -116,96 +106,85 @@ else:
         GROUP_COL: ["psa"] * n_psa + ["ad"] * n_ad,
         CONVERTED_COL: np.concatenate([conv_psa, conv_ad]),
         "total ads": np.random.poisson(24, size=n_total),
-        "most ads": np.random.choice(["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"], size=n_total),
+        "most ads": np.random.choice(
+            ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"],
+            size=n_total,
+        ),
     })
     # Add a few intentional dirty values to demonstrate data quality cleaning
     raw_df[CONVERTED_COL] = raw_df[CONVERTED_COL].astype(object)
-    raw_df.loc[0, GROUP_COL] = " psa "  # whitespace
-    raw_df.loc[1, CONVERTED_COL] = "True"  # string boolean
+    raw_df.loc[0, GROUP_COL] = " psa "
+    raw_df.loc[1, CONVERTED_COL] = "True"
     raw_df.loc[2, CONVERTED_COL] = "False"
 
-    # Save to data directory for subsequent runs
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    synth_path = DATA_DIR / "marketing_AB_sample.csv"
-    raw_df.to_csv(synth_path, index=False)
-    print(f"Sample dataset saved to: {synth_path}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_df.to_csv(output_path, index=False)
+    return raw_df
 
-print(f"Loaded DataFrame with shape: {raw_df.shape}")
 
-# %% [markdown]
-# ## 3. Step 1: Read CSV & Inspect Dataset
-# 
-# Prints columns, dtypes, row count, null counts per column, and duplicate row/user counts.
+def main(argv: Optional[List[str]] = None) -> Dict[str, Any]:
+    """Execute the full marketing A/B test analysis pipeline."""
+    args = parse_args(argv)
+    REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
-# %%
-inspection_results = inspect_data(raw_df, user_id_col=USER_ID_COL, print_output=True)
+    csv_file_path = _resolve_csv_path(args.csv)
+    used_synthetic = csv_file_path is None
 
-# %% [markdown]
-# ## 4. Step 2 & 3: Clean Data & Write Data-Quality Log
-# 
-# Cleans:
-# - Drop exact duplicate rows
-# - Drop rows with missing group or conversion value
-# - Convert conversion column from True/False or "True"/"False" to 0/1 integers
-# - Strip whitespace from group labels
-# 
-# Every action is appended to `reports/data_quality_log.md` as a Markdown table.
+    print("Environment initialized successfully.")
+    print(f"Target CSV Path      : {csv_file_path if csv_file_path else 'None found (using synthetic fallback)'}")
+    print(f"Configured Group Col : '{GROUP_COL}'")
+    print(f"Configured Conv Col  : '{CONVERTED_COL}'")
+    print(f"Configured User ID   : '{USER_ID_COL}'")
+    print(f"Group Mapping        : {GROUP_MAPPING}")
 
-# %%
-cleaned_df, quality_log = clean_data(
-    raw_df,
-    group_col=GROUP_COL,
-    converted_col=CONVERTED_COL,
-    user_id_col=USER_ID_COL,
-    log_path=LOG_PATH,
-)
+    if not used_synthetic and csv_file_path is not None:
+        print(f"Reading CSV from: {csv_file_path}")
+        raw_df = pd.read_csv(csv_file_path, low_memory=False)
+    else:
+        banner = "=" * 70
+        print(f"\n{banner}\nWARNING: {SYNTHETIC_NOTICE}\n{banner}")
+        print("Generating representative synthetic dataset matching Kaggle distributions (N=588,829)...")
+        synth_path = DATA_DIR / "marketing_AB_synthetic.csv"
+        raw_df = _generate_synthetic_dataset(synth_path)
+        print(f"Synthetic dataset saved to: {synth_path}")
 
-print(f"Cleaned dataset rows: {len(cleaned_df):,} (from {len(raw_df):,})")
-print(f"Quality audit log written to: {LOG_PATH}")
-print("\nData Quality Log Table:")
-print(LOG_PATH.read_text(encoding="utf-8"))
+    print(f"Loaded DataFrame with shape: {raw_df.shape}")
 
-# %% [markdown]
-# ## 5. Step 4: Map Group Labels to A (Control) and B (Treatment)
-# 
-# Validates and confirms group mapping:
-# Control is mapped to 'A', and Treatment is mapped to 'B'.
+    inspect_data(raw_df, user_id_col=USER_ID_COL, print_output=True)
 
-# %%
-mapped_df = map_groups(
-    cleaned_df,
-    group_col=GROUP_COL,
-    group_mapping=GROUP_MAPPING,
-    variant_col="variant",
-    print_confirmation=True,
-)
+    cleaned_df, _ = clean_data(
+        raw_df,
+        group_col=GROUP_COL,
+        converted_col=CONVERTED_COL,
+        user_id_col=USER_ID_COL,
+        log_path=LOG_PATH,
+    )
+    print(f"Cleaned dataset rows: {len(cleaned_df):,} (from {len(raw_df):,})")
+    print(f"Quality audit log written to: {LOG_PATH}")
 
-# %% [markdown]
-# ## 6. Step 5 & 6: Run Sample Ratio Check & Two-Proportion Z-Test
-# 
-# Runs `sample_ratio_check` and `two_prop_test` from `src.stats_engine`.
-# Prints plain English business conclusion and randomisation mechanism notice.
+    mapped_df = map_groups(
+        cleaned_df,
+        group_col=GROUP_COL,
+        group_mapping=GROUP_MAPPING,
+        variant_col="variant",
+        print_confirmation=True,
+    )
 
-# %%
-analysis_results = run_ab_analysis(
-    mapped_df,
-    variant_col="variant",
-    converted_col=CONVERTED_COL,
-    alpha=ALPHA,
-    print_output=True,
-)
+    analysis_results = run_ab_analysis(
+        mapped_df,
+        variant_col="variant",
+        converted_col=CONVERTED_COL,
+        alpha=ALPHA,
+        print_output=True,
+    )
 
-# %% [markdown]
-# ## 7. Dataset Limitations & Methodological Notes
-# 
-# Below are 5 key limitations specific to this dataset for inclusion in experimental reports:
-# 
-# 1. **Severe Group Imbalance (Power vs. Validity):** While the highly unequal group allocation (approximately 96% treatment to 4% control) reduces the experiment's statistical power compared to an equal 50/50 split of the same sample size, it does **not** compromise the mathematical validity or inflate the Type I error rate of the two-proportion z-test because success and failure counts in both arms vastly exceed the minimum threshold of 10.
-# 2. **Artificial SRM Flagging Under Balanced Assumptions:** Standard sample ratio mismatch (SRM) goodness-of-fit tests assume an intended 50/50 allocation and will flag a severe mismatch on this dataset; however, this discrepancy reflects an intentional unequal targeting design rather than faulty randomization or tracking failure.
-# 3. **Single High-Level Conversion Metric:** The dataset records only a single binary conversion indicator without monetary values (such as order amount, revenue per user, or acquisition cost), which prevents computing Return on Ad Spend (ROAS) or measuring cannibalization effects.
-# 4. **Absence of Temporal and Contextual Timestamps:** The lack of date and hour timestamps means we cannot control for day-of-week seasonality, external marketing shocks, or ad fatigue over time.
-# 5. **External Randomisation Dependence:** Because user assignments were executed externally rather than through our deterministic SHA-256 hash engine (`src/assign.py`), we cannot independently audit assignment salt integrity, device-level reassignment leaks, or attrition bias.
+    if used_synthetic:
+        banner = "=" * 70
+        print(f"{banner}\nREMINDER: {SYNTHETIC_NOTICE}\n{banner}")
 
-# %%
-if __name__ == "__main__":
     print("Analysis script execution finished successfully.")
+    return analysis_results
+
+
+if __name__ == "__main__":
+    main()

@@ -12,6 +12,7 @@ from pathlib import Path
 import sys
 from typing import Any, Dict, List, Optional, Tuple, Union
 
+import numpy as np
 import pandas as pd
 
 # Add project root to sys.path if not already present
@@ -506,7 +507,7 @@ def load_clean_and_test(
     if print_output:
         print(f"Loading dataset from: {filepath_or_buffer}")
 
-    df = pd.read_csv(filepath_or_buffer)
+    df = pd.read_csv(filepath_or_buffer, low_memory=False)
 
     # 1. Inspect
     inspect_data(df, user_id_col=user_id_col, print_output=print_output)
@@ -550,3 +551,106 @@ def load_clean_and_test(
     )
 
     return mapped_df, results
+
+
+def parse_conversion_series(series: pd.Series) -> Tuple[pd.Series, int]:
+    """Parse a Series of conversion outcomes using _parse_conversion_value.
+
+    Maps unique non-null values once for O(unique) parsing overhead so large
+    DataFrames (e.g. 588k+ rows) parse in milliseconds.
+
+    Returns:
+        Tuple of (parsed_series, unparseable_count) where parsed_series has
+        values 0.0, 1.0, or NaN for missing/unparseable entries.
+    """
+    unique_vals = series.dropna().unique()
+    mapping: Dict[Any, float] = {}
+    unparseable_keys: set[Any] = set()
+
+    for val in unique_vals:
+        try:
+            mapping[val] = float(_parse_conversion_value(val))
+        except ValueError:
+            # Keep unparseable values distinct from 0 so callers can report & skip them.
+            unparseable_keys.add(val)
+
+    parsed = series.map(mapping)
+    unparseable_count = int(series.isin(unparseable_keys).sum()) if unparseable_keys else 0
+    return parsed, unparseable_count
+
+
+def prepare_csv_for_experiment(
+    df: pd.DataFrame,
+    group_col: str,
+    conv_col: str,
+    val_a: str,
+    val_b: str,
+    user_id_col: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Dict[str, int]]:
+    """Clean and vectorize a DataFrame for experiment ingestion.
+
+    Returns:
+        Tuple of (uids, variants, conv_bool, stats) where stats summarizes
+        skipped_blank, skipped_other_groups, skipped_unparseable,
+        dropped_duplicate_users, and ingested_rows.
+    """
+    cols = [group_col, conv_col] + ([user_id_col] if user_id_col else [])
+    work_df = df[cols].copy()
+    total_rows = len(work_df)
+
+    # Normalize group labels (strip whitespace) and treat empty strings as blank.
+    grp_na = work_df[group_col].isna()
+    work_df[group_col] = work_df[group_col].astype(str).str.strip()
+    grp_blank = grp_na | (work_df[group_col] == "")
+
+    conv_na = work_df[conv_col].isna()
+    if work_df[conv_col].dtype == object or pd.api.types.is_string_dtype(work_df[conv_col]):
+        conv_blank = conv_na | (work_df[conv_col].astype(str).str.strip() == "")
+    else:
+        conv_blank = conv_na
+
+    uid_blank = work_df[user_id_col].isna() if user_id_col else pd.Series(False, index=work_df.index)
+    blank_mask = grp_blank | conv_blank | uid_blank
+    skipped_blank = int(blank_mask.sum())
+    work_df = work_df[~blank_mask]
+
+    # Filter to the two selected group labels.
+    in_groups = work_df[group_col].isin([val_a, val_b])
+    skipped_other_groups = int((~in_groups).sum())
+    work_df = work_df[in_groups]
+
+    # Parse conversion outcomes using _parse_conversion_value.
+    parsed_conv, skipped_unparseable = parse_conversion_series(work_df[conv_col])
+    work_df = work_df.assign(_parsed_conv=parsed_conv)
+    work_df = work_df[work_df["_parsed_conv"].notna()]
+
+    # Drop duplicate user IDs if a User ID column was chosen.
+    dropped_duplicate_users = 0
+    if user_id_col is not None:
+        dropped_duplicate_users = int(work_df[user_id_col].duplicated(keep="first").sum())
+        if dropped_duplicate_users > 0:
+            work_df = work_df.drop_duplicates(subset=[user_id_col], keep="first")
+
+        try:
+            numeric_uids = pd.to_numeric(work_df[user_id_col], errors="raise")
+            if (numeric_uids % 1 == 0).all():
+                uids = numeric_uids.to_numpy(dtype=np.int64)
+            else:
+                uids = (pd.factorize(work_df[user_id_col])[0] + 1).astype(np.int64)
+        except (ValueError, TypeError):
+            uids = (pd.factorize(work_df[user_id_col])[0] + 1).astype(np.int64)
+    else:
+        uids = np.arange(1, len(work_df) + 1, dtype=np.int64)
+
+    variants = np.where(work_df[group_col].to_numpy() == val_a, "A", "B")
+    conv_bool = work_df["_parsed_conv"].to_numpy(dtype=int) == 1
+
+    stats = {
+        "total_rows": total_rows,
+        "skipped_blank": skipped_blank,
+        "skipped_other_groups": skipped_other_groups,
+        "skipped_unparseable": skipped_unparseable,
+        "dropped_duplicate_users": dropped_duplicate_users,
+        "ingested_rows": len(work_df),
+    }
+    return uids, variants, conv_bool, stats
