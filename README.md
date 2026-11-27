@@ -4,6 +4,8 @@ A production-grade Python framework and interactive Streamlit application design
 Integrates SHA-256 deterministic variant assignment, robust SQLite event tracking, and two-proportion z-tests validated against Statsmodels.
 Features Monte Carlo simulation engines demonstrating A/A uniform p-value calibration, optional stopping alpha inflation, and empirical power curves.
 
+**Live App:** [https://ab-testing-platform-hkgg7yk93cdavdgvhacxsu.streamlit.app/](https://ab-testing-platform-hkgg7yk93cdavdgvhacxsu.streamlit.app/)
+
 See [docs/HOW_IT_WORKS.md](docs/HOW_IT_WORKS.md) for a detailed module-by-module guide, database schema, data flows, and glossary.
 
 ---
@@ -106,7 +108,9 @@ maths/
 
 ## 4. How to Run the App
 
-Launch the interactive multi-tab Streamlit dashboard:
+**Live Deployment:** [https://ab-testing-platform-hkgg7yk93cdavdgvhacxsu.streamlit.app/](https://ab-testing-platform-hkgg7yk93cdavdgvhacxsu.streamlit.app/)
+
+To run locally, launch the interactive multi-tab Streamlit dashboard:
 
 ```bash
 streamlit run app/app.py
